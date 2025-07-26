@@ -1,42 +1,43 @@
 import {
   Injectable,
-  ConflictException,
-  NotFoundException,
   UnauthorizedException,
   BadRequestException,
+  Inject,
+  ForbiddenException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { User } from './auth.schema';
 import { Model } from 'mongoose';
 import { SignUpUserDto } from './dto/sign-up.dto';
-import { UpdateUserDto } from './dto/update-user.dto';
 import { SigninUserDto } from './dto/sign-in.dto';
-
-export interface UserResponse {
-  _id: string;
-  name: string;
-  email: string;
-  posts: string[];
-  createdAt?: Date;
-  updatedAt?: Date;
-}
+import { JwtService } from '@nestjs/jwt';
+import refreshJwtConfig from './config/refresh-jwt.config';
+import jwtConfig from './config/jwt.config';
+import { ConfigType } from '@nestjs/config';
+import { UserService } from 'src/user/user.service';
+import * as argon2 from 'argon2';
 
 @Injectable()
 export class AuthService {
   constructor(
     @InjectModel(User.name) private readonly userModel: Model<User>,
+    private jwtService: JwtService,
+    private userService: UserService,
+    @Inject(refreshJwtConfig.KEY)
+    private refreshTokenConfig: ConfigType<typeof refreshJwtConfig>,
+    @Inject(jwtConfig.KEY)
+    private jwtConfiguration: ConfigType<typeof jwtConfig>,
   ) {}
 
-  /**
-   * Transform user document to response format
-   * @param user - User document
-   * @returns User response without sensitive fields
-   */
-  private transformUserToResponse(user: any): UserResponse {
-    const { password, refreshToken, ...userWithoutPassword } = user.toObject();
+  async generateTokens(userId: string) {
+    const payload = { sub: userId };
+    const [accessToken, refreshToken] = await Promise.all([
+      this.jwtService.signAsync(payload),
+      this.jwtService.signAsync(payload, this.refreshTokenConfig),
+    ]);
     return {
-      ...userWithoutPassword,
-      _id: userWithoutPassword._id.toString(),
+      accessToken,
+      refreshToken,
     };
   }
 
@@ -45,26 +46,30 @@ export class AuthService {
    * @param signUpUserDto - User creation data
    * @returns Created user without password
    */
-  async createUser(signUpUserDto: SignUpUserDto): Promise<UserResponse> {
-    try {
-      const existingUser = await this.userModel.findOne({
-        email: signUpUserDto.email,
-      });
-      if (existingUser) {
-        throw new ConflictException('User with this email already exists');
-      }
-
-      // Create new user
-      const newUser = new this.userModel(signUpUserDto);
-      const savedUser = await newUser.save();
-
-      return this.transformUserToResponse(savedUser);
-    } catch (error) {
-      if (error instanceof ConflictException) {
-        throw error;
-      }
-      throw new BadRequestException('Failed to create user');
+  async signUp(signUpData: SignUpUserDto) {
+    const { email, name, password } = signUpData;
+    const existingUser = await this.userModel.findOne({
+      email: email,
+    });
+    if (existingUser) {
+      throw new BadRequestException('User with this email already exists');
     }
+    const hashedPassword = await argon2.hash(password);
+
+    const user = await this.userModel.create({
+      name,
+      email,
+      password: hashedPassword,
+    });
+
+    const { accessToken, refreshToken } = await this.generateTokens(
+      user._id as string,
+    );
+    return {
+      userId: user._id,
+      accessToken,
+      refreshToken,
+    };
   }
 
   /**
@@ -73,195 +78,77 @@ export class AuthService {
    * @returns User with tokens
    */
 
-  async loginUser(signinUserDto: SigninUserDto): Promise<{
-    user: UserResponse;
-    accessToken: string;
-    refreshToken: string;
-  }> {
-    const { email, password } = signinUserDto;
+  async signIn(signinData: SigninUserDto) {
+    const { email, password } = signinData;
 
-    const user = (await this.userModel
-      .findOne({ email })
-      .select('+password')) as any;
+    const user = await this.userModel.findOne({ email }).select('+password');
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const isPasswordValid = await user.comparePassword(password);
+    console.log('user', user);
+
+    const isPasswordValid = await argon2.verify(user.password, password);
+    console.log('password ', password, ' user password ', user.password);
+    console.log('is', isPasswordValid);
+
     if (!isPasswordValid) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Generate tokens
-    const accessToken = user.createAccessToken();
-    const refreshToken = user.createRefreshToken();
-
-    // Save refresh token
-    user.refreshToken = refreshToken;
-    await user.save();
-
+    const { accessToken, refreshToken } = await this.generateTokens(
+      user._id as string,
+    );
+    await this.userService.updateRefreshToken(user._id as string, refreshToken);
     return {
-      user: this.transformUserToResponse(user),
       accessToken,
       refreshToken,
+      userId: user._id,
     };
   }
 
-  //   /**
-  //    * Get all users
-  //    * @returns Array of users without passwords
-  //    */
-  //   async findAllUsers(): Promise<UserResponse[]> {
-  //     const users = await this.userModel.find().populate('posts');
-  //     return users.map((user) => this.transformUserToResponse(user));
-  //   }
+  /**
+   * Logout user by clearing their refresh token
+   * @param userId - User ID to logout
+   * @returns Success message
+   */
+  async logout(userId: string) {
+    const user = await this.userModel.findById(userId).select('+refreshToken');
 
-  //   /**
-  //    * Get user by ID
-  //    * @param id - User ID
-  //    * @returns User without password
-  //    */
-  //   async findUserById(id: string): Promise<UserResponse> {
-  //     const user = await this.userModel.findById(id).populate('posts');
-  //     if (!user) {
-  //       throw new NotFoundException('User not found');
-  //     }
+    if (!user) {
+      throw new UnauthorizedException('Invalid user');
+    }
 
-  //     return this.transformUserToResponse(user);
-  //   }
+    // Clear the refresh token from the database
+    await this.userModel.findByIdAndUpdate(userId, { refreshToken: null });
 
-  //   /**
-  //    * Get user by email
-  //    * @param email - User email
-  //    * @returns User without password
-  //    */
-  //   async findUserByEmail(email: string): Promise<UserResponse> {
-  //     const user = await this.userModel.findOne({ email }).populate('posts');
-  //     if (!user) {
-  //       throw new NotFoundException('User not found');
-  //     }
+    return {
+      message: 'Logged out successfully',
+    };
+  }
 
-  //     return this.transformUserToResponse(user);
-  //   }
+  /**
+   * Refresh access and refresh tokens using a valid refresh token
+   * @param userId - User ID requesting token refresh
+   * @param refreshToken - Current refresh token
+   * @returns New access and refresh tokens
+   */
+  async refreshTokens(userId: string, refreshToken: string) {
+    const user = await this.userModel.findById(userId).select('+refreshToken');
 
-  //   /**
-  //    * Update user by ID
-  //    * @param id - User ID
-  //    * @param updateUserDto - Update data
-  //    * @returns Updated user without password
-  //    */
-  //   async updateUser(
-  //     id: string,
-  //     updateUserDto: UpdateUserDto,
-  //   ): Promise<UserResponse> {
-  //     // Check if email is being updated and if it's already taken
-  //     if (updateUserDto.email) {
-  //       const existingUser = await this.userModel.findOne({
-  //         email: updateUserDto.email,
-  //         _id: { $ne: id },
-  //       });
-  //       if (existingUser) {
-  //         throw new ConflictException('Email is already taken by another user');
-  //       }
-  //     }
-
-  //     const updatedUser = await this.userModel
-  //       .findByIdAndUpdate(id, updateUserDto, { new: true, runValidators: true })
-  //       .populate('posts');
-
-  //     if (!updatedUser) {
-  //       throw new NotFoundException('User not found');
-  //     }
-
-  //     return this.transformUserToResponse(updatedUser);
-  //   }
-
-  //   /**
-  //    * Delete user by ID
-  //    * @param id - User ID
-  //    * @returns Success message
-  //    */
-  //   async deleteUser(id: string): Promise<{ message: string }> {
-  //     const deletedUser = await this.userModel.findByIdAndDelete(id);
-  //     if (!deletedUser) {
-  //       throw new NotFoundException('User not found');
-  //     }
-
-  //     return { message: 'User deleted successfully' };
-  //   }
-
-  //   /**
-  //    * Logout user by clearing refresh token
-  //    * @param id - User ID
-  //    * @returns Success message
-  //    */
-  //   async logoutUser(id: string): Promise<{ message: string }> {
-  //     const user = await this.userModel.findById(id);
-  //     if (!user) {
-  //       throw new NotFoundException('User not found');
-  //     }
-
-  //     user.refreshToken = undefined;
-  //     await user.save();
-
-  //     return { message: 'User logged out successfully' };
-  //   }
-
-  //   /**
-  //    * Refresh access token using refresh token
-  //    * @param refreshToken - Refresh token
-  //    * @returns New access token
-  //    */
-  //   async refreshAccessToken(
-  //     refreshToken: string,
-  //   ): Promise<{ accessToken: string }> {
-  //     const user = (await this.userModel
-  //       .findOne({ refreshToken })
-  //       .select('+refreshToken')) as any;
-  //     if (!user) {
-  //       throw new UnauthorizedException('Invalid refresh token');
-  //     }
-
-  //     const newAccessToken = user.createAccessToken();
-  //     return { accessToken: newAccessToken };
-  //   }
-
-  //   /**
-  //    * Add post to user's posts array
-  //    * @param userId - User ID
-  //    * @param postId - Post ID
-  //    * @returns Updated user
-  //    */
-  //   async addPostToUser(userId: string, postId: string): Promise<UserResponse> {
-  //     const user = await this.userModel
-  //       .findByIdAndUpdate(userId, { $push: { posts: postId } }, { new: true })
-  //       .populate('posts');
-
-  //     if (!user) {
-  //       throw new NotFoundException('User not found');
-  //     }
-
-  //     return this.transformUserToResponse(user);
-  //   }
-
-  //   /**
-  //    * Remove post from user's posts array
-  //    * @param userId - User ID
-  //    * @param postId - Post ID
-  //    * @returns Updated user
-  //    */
-  //   async removePostFromUser(
-  //     userId: string,
-  //     postId: string,
-  //   ): Promise<UserResponse> {
-  //     const user = await this.userModel
-  //       .findByIdAndUpdate(userId, { $pull: { posts: postId } }, { new: true })
-  //       .populate('posts');
-
-  //     if (!user) {
-  //       throw new NotFoundException('User not found');
-  //     }
-
-  //     return this.transformUserToResponse(user);
-  //   }
+    if (!user || !user.refreshToken) {
+      throw new UnauthorizedException('Invalid refresh token or user');
+    }
+    const isrefreshTokenMatches = await argon2.verify(
+      user.refreshToken,
+      refreshToken,
+    );
+    if (!isrefreshTokenMatches) throw new ForbiddenException('Access Denied');
+    const tokens = await this.generateTokens(user._id as string);
+    await this.userService.updateRefreshToken(
+      user._id as string,
+      tokens.refreshToken,
+    );
+    return tokens;
+  }
 }
